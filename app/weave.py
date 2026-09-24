@@ -719,6 +719,30 @@ def _matrix_diff(a: list[list[int]], b: list[list[int]]) -> int:
     )
 
 
+def _line_violation_count(x: int, n: int, cyclic: bool, max_float: int) -> int:
+    """统计 n 位序列中长度超过 max_float 的目标连续段数。
+
+    x 的第 i 位为 1 表示位置 i 取目标值（经向列为 1 的位、纬向行为 0 的位
+    取反后传入）。连续段枚举与循环合并规则和 _runs 逐条一致：cyclic 时
+    首段自 0 开始且尾段抵达末尾则合并为一段。用「x + (x & -x) 进位穿过
+    最低一段 1」的位技巧逐段弹出，每段只有常数次大整数运算。
+    """
+    runs: list[tuple[int, int]] = []
+    while x:
+        low = x & -x                 # 最低一段 1 的起点（最低置位）
+        start = low.bit_length() - 1
+        y = x + low                  # 进位穿过整段：段内清零，段后第一个 0 变 1
+        length = (x ^ y).bit_length() - 1 - start
+        x &= y                       # 清除该段，继续下一段
+        runs.append((start, length))
+    if cyclic and len(runs) > 1:
+        first, last = runs[0], runs[-1]
+        if first[0] == 0 and last[0] + last[1] == n:
+            merged = (last[0], last[1] + first[1])
+            runs = [merged] + runs[1:-1]
+    return sum(1 for _, length in runs if length > max_float)
+
+
 def search_repair_plans(
     threading: list[int],
     tie_up: list[list[int]],
@@ -740,6 +764,18 @@ def search_repair_plans(
     - 收录方案按 (最终违规数, 改动数, 最终矩阵相对原矩阵的变化点数,
       翻转序列字典序) 升序稳定排序，等价终态只保留排序最优的序列；
     - 返回前 limit 条。不修改传入的 tie_up。
+
+    性能说明：逐层枚举、状态去重、收录与排序规则与「每个状态完整重算
+    审计」完全一致，但搜索过程中不做完整重算——
+    - 交织矩阵用行位图 + 列位图（每行/列一个大整数，第 i 位对应该行/列
+      第 i 个单元）表示，翻转一个绑综单元只是对受影响行/列做按位异或；
+    - 每次翻转只重算**受影响的经列与纬行**的超限段数（单条线的段枚举用
+      位运算完成，重复出现的行/列模式按位图缓存），其余行/列的计数不变，
+      由增量得到该状态的违规总数；变化点数同样按翻转位的 popcount 增量
+      维护；
+    - 候选方案只携带轻量元组参与排序，仅对最终入选的前 limit 条方案，
+      从绑综位图重建 tie_up 并**完整重算**交织矩阵与违规列表（并断言
+      与增量计数逐项一致），保证返回结果与完整重算完全相同。
     """
     if not isinstance(max_changes, int) or isinstance(max_changes, bool):
         raise DesignError("max_changes must be an integer")
@@ -754,6 +790,8 @@ def search_repair_plans(
 
     treadles = len(tie_up)
     shafts = len(tie_up[0])
+    picks = len(treadling)         # 纬纱数（行数）
+    ends = len(threading)          # 经纱数（列数）
     cells = [(t, s) for t in range(treadles) for s in range(shafts)]
     base_mask = sum(
         tie_up[t][s] << (t * shafts + s) for t, s in cells
@@ -770,21 +808,66 @@ def search_repair_plans(
         picks_h = [h for h, pick in enumerate(treadling) if pick == t]
         ends_w = [w for w, shaft in enumerate(threading) if shaft == s]
         affected_points.append((picks_h, ends_w))
+    # 翻转单元 idx 时作用在每条受影响行上的列位掩码 / 每条受影响列上的行位掩码
+    flip_row_masks = [
+        sum(1 << w for w in ends_w) for _, ends_w in affected_points
+    ]
+    flip_col_masks = [
+        sum(1 << h for h in picks_h) for picks_h, _ in affected_points
+    ]
 
-    # BFS 节点：(tie_up 位图, 当前矩阵, 翻转单元索引序列, 逐步记录)
+    # 基态行/列位图：row_bits[h] 第 w 位 = matrix[h][w]，col_bits[w] 第 h 位同
+    row_full = (1 << ends) - 1
+    base_rows = [
+        sum(v << w for w, v in enumerate(row)) for row in base_matrix
+    ]
+    base_cols = [
+        sum(base_matrix[h][w] << h for h in range(picks)) for w in range(ends)
+    ]
+
+    # 单条线超限段数缓存：键为「目标位置位图」（纬向行取 0 的位、经向列取
+    # 1 的位），搜索全程 cyclic / max_float / 线长固定，位图相同则计数相同
+    row_count_cache: dict[int, int] = {}
+    col_count_cache: dict[int, int] = {}
+
+    def weft_count(row_bits: int) -> int:
+        # 纬向浮长是行内连续的 0：取反后统计 1 的连续段
+        target = ~row_bits & row_full
+        cached = row_count_cache.get(target)
+        if cached is None:
+            cached = _line_violation_count(target, ends, cyclic, max_float)
+            row_count_cache[target] = cached
+        return cached
+
+    def warp_count(col_bits: int) -> int:
+        cached = col_count_cache.get(col_bits)
+        if cached is None:
+            cached = _line_violation_count(col_bits, picks, cyclic, max_float)
+            col_count_cache[col_bits] = cached
+        return cached
+
+    # BFS 节点：(tie_up 位图, 行位图, 列位图, 违规总数, 变化点数,
+    #            翻转单元索引序列, 各步翻转后的违规总数)
     # visited 保证每个绑综状态只展开一次；按单元 (treadle, shaft) 字典序展开，
     # 首次到达某状态的序列即翻转序列字典序最小者。
     visited: set[int] = {base_mask}
-    frontier: list[tuple[int, list[list[int]], list[int], list[RepairPlanStep]]] = [
-        (base_mask, base_matrix, [], [])
-    ]
-    plans: list[RepairPlan] = []
+    frontier: list[
+        tuple[int, list[int], list[int], int, int, tuple[int, ...], tuple[int, ...]]
+    ] = [(base_mask, base_rows, base_cols, base_count, 0, (), ())]
+    # 候选方案：(最终违规数, 改动数, 变化点数, 翻转单元索引序列,
+    #            各步违规总数, 终态 tie_up 位图)
+    candidates: list[
+        tuple[int, int, int, tuple[int, ...], tuple[int, ...], int]
+    ] = []
 
     for depth in range(1, max_changes + 1):
         next_frontier: list[
-            tuple[int, list[list[int]], list[int], list[RepairPlanStep]]
+            tuple[
+                int, list[int], list[int], int, int,
+                tuple[int, ...], tuple[int, ...],
+            ]
         ] = []
-        for mask, matrix, seq, steps in frontier:
+        for mask, rows, cols, total, changed, seq, totals in frontier:
             used = set(seq)
             for idx, (t, s) in enumerate(cells):
                 if idx in used:
@@ -795,57 +878,113 @@ def search_repair_plans(
                     continue
                 visited.add(child_mask)
 
-                old_value = (mask >> bit) & 1
-                new_value = 1 - old_value
                 picks_h, ends_w = affected_points[idx]
-                child_matrix = [row[:] for row in matrix]
-                for h in picks_h:
-                    for w in ends_w:
-                        child_matrix[h][w] = new_value
+                row_flip = flip_row_masks[idx]
+                col_flip = flip_col_masks[idx]
 
-                child_violations = violations_of_matrix(
-                    child_matrix, max_float, cyclic
-                )
-                child_seq = seq + [idx]
-                child_steps = steps + [
-                    RepairPlanStep(
-                        step=depth,
-                        treadle=t,
-                        shaft=s,
-                        old_value=old_value,
-                        new_value=new_value,
-                        violations_after=len(child_violations),
-                    )
-                ]
+                # 仅受影响的纬行 / 经列取值变化：只更新这些行/列的位图，
+                # 违规总数按这些线的新旧计数差增量维护，其余线不变。
+                child_rows = rows[:]
+                child_cols = cols[:]
+                delta = 0
+                for h in picks_h:
+                    new_bits = rows[h] ^ row_flip
+                    child_rows[h] = new_bits
+                    delta += weft_count(new_bits) - weft_count(rows[h])
+                for w in ends_w:
+                    new_bits = cols[w] ^ col_flip
+                    child_cols[w] = new_bits
+                    delta += warp_count(new_bits) - warp_count(cols[w])
+                child_total = total + delta
+
+                # 变化点数增量：受影响行内，翻转位中与原矩阵相同的位变为
+                # 不同（+1），不同的位变为相同（-1）
+                delta_changed = 0
+                for h in picks_h:
+                    same_as_base = (
+                        ~(rows[h] ^ base_rows[h]) & row_flip
+                    ).bit_count()
+                    delta_changed += 2 * same_as_base - len(ends_w)
+                child_changed = changed + delta_changed
+
+                child_seq = seq + (idx,)
+                child_totals = totals + (child_total,)
 
                 # 中间状态允许违规数不下降：仍入队以便继续展开；
-                # 仅当终态严格优于原设计时收录为方案。
+                # 仅当终态严格优于原设计时收录为候选方案。
                 if depth < max_changes:
                     next_frontier.append(
-                        (child_mask, child_matrix, child_seq, child_steps)
+                        (
+                            child_mask,
+                            child_rows,
+                            child_cols,
+                            child_total,
+                            child_changed,
+                            child_seq,
+                            child_totals,
+                        )
                     )
-                if len(child_violations) < base_count:
-                    plans.append(
-                        RepairPlan(
-                            changes=len(child_seq),
-                            final_violations=len(child_violations),
-                            changed_points=_matrix_diff(base_matrix, child_matrix),
-                            steps=child_steps,
-                            violations=child_violations,
-                            interlacing=child_matrix,
+                if child_total < base_count:
+                    candidates.append(
+                        (
+                            child_total,
+                            depth,
+                            child_changed,
+                            child_seq,
+                            child_totals,
+                            child_mask,
                         )
                     )
         frontier = next_frontier
 
-    plans.sort(
-        key=lambda p: (
-            p.final_violations,
-            p.changes,
-            p.changed_points,
-            tuple((s.treadle, s.shaft) for s in p.steps),
+    candidates.sort(
+        key=lambda c: (
+            c[0],
+            c[1],
+            c[2],
+            tuple(cells[idx] for idx in c[3]),
         )
     )
-    return plans[:limit]
+
+    # 仅为最终入选的前 limit 条方案构造完整结果：从终态绑综位图重建
+    # tie_up 后完整重算交织矩阵与违规列表，保证与完整重算逐项一致。
+    plans: list[RepairPlan] = []
+    for total, changes, changed, seq, totals, mask in candidates[:limit]:
+        final_tie_up = [
+            [(mask >> (t * shafts + s)) & 1 for s in range(shafts)]
+            for t in range(treadles)
+        ]
+        matrix, violations = audit_floats(
+            threading, final_tie_up, treadling, max_float, cyclic
+        )
+        # 增量维护的计数与完整重算互为校验，二者必须一致
+        assert len(violations) == total
+        assert _matrix_diff(base_matrix, matrix) == changed
+        steps = []
+        for k, idx in enumerate(seq):
+            t, s = cells[idx]
+            old_value = tie_up[t][s]  # 同一单元一条序列内只翻一次，必为基态值
+            steps.append(
+                RepairPlanStep(
+                    step=k + 1,
+                    treadle=t,
+                    shaft=s,
+                    old_value=old_value,
+                    new_value=1 - old_value,
+                    violations_after=totals[k],
+                )
+            )
+        plans.append(
+            RepairPlan(
+                changes=changes,
+                final_violations=total,
+                changed_points=changed,
+                steps=steps,
+                violations=violations,
+                interlacing=matrix,
+            )
+        )
+    return plans
 
 
 def _cyclic_shift(

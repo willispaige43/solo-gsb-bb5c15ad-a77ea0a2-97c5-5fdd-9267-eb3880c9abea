@@ -522,6 +522,12 @@ curl -s -X POST 'http://localhost:8000/designs/1/tie-up-suggestions?limit=5'
 排序最优的翻转序列。接口只读计算，**不修改原设计**；设计不存在返回 404，
 没有改善方案时返回空列表 `[]`。
 
+实现上按「每次翻转只更新受影响经列与纬行的浮长计数」做增量审计（行/列
+位图 + 位运算段计数），逐层枚举、状态去重、收录、排序与平局规则不变；
+仅对最终入选的前 `limit` 条方案重建绑综并完整重算交织矩阵与违规列表，
+返回结果与逐状态完整重算**逐项一致**——8×8 绑综、16×16 交织、
+`max_changes=3&limit=5` 在 8 秒内响应。
+
 查询参数：
 
 | 参数 | 范围 | 默认 | 说明 |
@@ -1128,6 +1134,7 @@ python3 tests/test_weave.py                  # 核心逻辑单元测试（无外
 python3 tests/test_api_designs_page.py       # designs/page keyset 分页接口集成测试
 python3 tests/test_api_repeat_period.py      # repeat-period 接口集成测试
 python3 tests/test_api_threshold_profile.py  # threshold-profile 接口集成测试
+python3 tests/test_api_repair_plans.py       # repair-plans 接口集成测试（含 8 秒耗时回归）
 python3 tests/test_api_compare.py            # compare 接口集成测试
 python3 tests/test_api_balance_hotspots.py   # balance-hotspots 接口集成测试
 python3 tests/test_api_loom_fit.py           # loom-fit 接口集成测试
@@ -1185,6 +1192,7 @@ tests/
   test_api_designs_page.py        # designs/page keyset 分页接口集成测试（TestClient，临时库）
   test_api_repeat_period.py       # repeat-period 接口集成测试（TestClient，临时库）
   test_api_threshold_profile.py   # threshold-profile 接口集成测试（TestClient，临时库）
+  test_api_repair_plans.py        # repair-plans 接口集成测试（TestClient，临时库，含 8 秒耗时回归）
   test_api_compare.py             # compare 接口集成测试（TestClient，临时库）
   test_api_balance_hotspots.py    # balance-hotspots 接口集成测试（TestClient，临时库）
   test_api_loom_fit.py            # loom-fit 接口集成测试（TestClient，临时库）

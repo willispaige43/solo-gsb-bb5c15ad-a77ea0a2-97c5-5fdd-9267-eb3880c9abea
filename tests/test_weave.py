@@ -9,6 +9,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from app.weave import (  # noqa: E402
     DesignError,
     FloatViolation,
+    RepairPlan,
+    RepairPlanStep,
     aggregate_float_risk_zones,
     analyze_repeat_period,
     audit_floats,
@@ -22,6 +24,7 @@ from app.weave import (  # noqa: E402
     threshold_profile,
     validate_design,
     violations_of_matrix,
+    _line_violation_count,
     _proper_divisors,
     _runs,
 )
@@ -417,6 +420,238 @@ def test_repair_plans_limit_and_validation():
     except DesignError:
         pass
     print("  ok: repair plan parameter validation")
+
+
+def _reference_repair_plans(threading, tie_up, treadling, max_float, cyclic,
+                            max_changes, limit):
+    """完整重算版多步修复搜索（增量优化前的朴素实现）：每个状态复制整幅
+    矩阵并重跑完整审计，作为逐项一致性的对照基准。"""
+    treadles = len(tie_up)
+    shafts = len(tie_up[0])
+    cells = [(t, s) for t in range(treadles) for s in range(shafts)]
+    base_mask = sum(tie_up[t][s] << (t * shafts + s) for t, s in cells)
+    base_matrix, base_violations = audit_floats(
+        threading, tie_up, treadling, max_float, cyclic
+    )
+    base_count = len(base_violations)
+    affected = []
+    for t, s in cells:
+        picks_h = [h for h, pick in enumerate(treadling) if pick == t]
+        ends_w = [w for w, shaft in enumerate(threading) if shaft == s]
+        affected.append((picks_h, ends_w))
+
+    visited = {base_mask}
+    frontier = [(base_mask, base_matrix, [], [])]
+    plans = []
+    for depth in range(1, max_changes + 1):
+        next_frontier = []
+        for mask, matrix, seq, steps in frontier:
+            used = set(seq)
+            for idx, (t, s) in enumerate(cells):
+                if idx in used:
+                    continue
+                bit = t * shafts + s
+                child_mask = mask ^ (1 << bit)
+                if child_mask in visited:
+                    continue
+                visited.add(child_mask)
+                old_value = (mask >> bit) & 1
+                new_value = 1 - old_value
+                picks_h, ends_w = affected[idx]
+                child_matrix = [row[:] for row in matrix]
+                for h in picks_h:
+                    for w in ends_w:
+                        child_matrix[h][w] = new_value
+                child_violations = violations_of_matrix(
+                    child_matrix, max_float, cyclic
+                )
+                child_seq = seq + [idx]
+                child_steps = steps + [
+                    RepairPlanStep(
+                        step=depth, treadle=t, shaft=s,
+                        old_value=old_value, new_value=new_value,
+                        violations_after=len(child_violations),
+                    )
+                ]
+                if depth < max_changes:
+                    next_frontier.append(
+                        (child_mask, child_matrix, child_seq, child_steps)
+                    )
+                if len(child_violations) < base_count:
+                    changed = sum(
+                        a != b
+                        for row_a, row_b in zip(base_matrix, child_matrix)
+                        for a, b in zip(row_a, row_b)
+                    )
+                    plans.append(
+                        RepairPlan(
+                            changes=len(child_seq),
+                            final_violations=len(child_violations),
+                            changed_points=changed,
+                            steps=child_steps,
+                            violations=child_violations,
+                            interlacing=child_matrix,
+                        )
+                    )
+        frontier = next_frontier
+    plans.sort(
+        key=lambda p: (
+            p.final_violations, p.changes, p.changed_points,
+            tuple((s.treadle, s.shaft) for s in p.steps),
+        )
+    )
+    return plans[:limit]
+
+
+def _plan_signature(p):
+    """方案的全部对外字段展开为可比较元组（逐项一致性的比较基准）。"""
+    return (
+        p.changes,
+        p.final_violations,
+        p.changed_points,
+        [(s.step, s.treadle, s.shaft, s.old_value, s.new_value,
+          s.violations_after) for s in p.steps],
+        [(v.direction, v.yarn_index, v.start, v.length) for v in p.violations],
+        tuple(tuple(row) for row in p.interlacing),
+    )
+
+
+def test_repair_plans_line_counter_matches_runs():
+    """增量审计的单线超限段计数器与 _runs 逐段枚举一致：小尺寸穷举全部
+    线型，较大尺寸随机抽查，覆盖 cyclic/非循环、0/1 两种目标与多档阈值。"""
+    rng = random.Random(20260924)
+    mismatches = 0
+    for n in (1, 2, 3, 4, 5, 6, 7, 8):
+        patterns = range(1 << n)
+        for bits in patterns:
+            line = [(bits >> i) & 1 for i in range(n)]
+            for cyclic in (False, True):
+                for max_float in (1, 2, 3):
+                    for target in (0, 1):
+                        want = sum(
+                            1 for _, length in _runs(line, target, cyclic)
+                            if length > max_float
+                        )
+                        x = bits if target == 1 else (~bits) & ((1 << n) - 1)
+                        if _line_violation_count(x, n, cyclic, max_float) != want:
+                            mismatches += 1
+    for n in (12, 16, 24, 33):
+        for _ in range(300):
+            bits = rng.getrandbits(n)
+            line = [(bits >> i) & 1 for i in range(n)]
+            for cyclic in (False, True):
+                for max_float in (1, 2, 3, 5):
+                    for target in (0, 1):
+                        want = sum(
+                            1 for _, length in _runs(line, target, cyclic)
+                            if length > max_float
+                        )
+                        x = bits if target == 1 else (~bits) & ((1 << n) - 1)
+                        if _line_violation_count(x, n, cyclic, max_float) != want:
+                            mismatches += 1
+    check(mismatches == 0,
+          "incremental line counter matches _runs on exhaustive/random lines")
+
+
+def test_repair_plans_matches_full_recompute():
+    """增量搜索与完整重算参考实现在多组设计上逐项一致：方案列表、逐步
+    violations_after、终态违规列表与终态矩阵、排序与平局裁决全部相同。"""
+    rng = random.Random(20260924)
+    cases = [
+        # 既有单元测试用例（含需要两次翻转与状态去重的场景）
+        ([0], [[1]] * 6, [0, 1, 2, 3, 4, 5], 2, True, 2, 50),
+        ([0], [[1]] * 6, [0, 1, 2, 3, 4, 5], 2, True, 3, 3),
+        ([0, 1], [[1, 1], [0, 0]], [0, 0, 0, 1], 2, False, 3, 50),
+        ([0, 1, 1], [[1, 1], [0, 0]], [0, 0, 0, 1], 2, False, 3, 50),
+    ]
+    # 随机设计：完整重算代价可承受的规模，覆盖 cyclic/非循环与 1..3 步
+    for _ in range(10):
+        shafts = treadles = rng.randint(2, 4)
+        ends = rng.randint(2, 8)
+        picks = rng.randint(2, 8)
+        threading = [rng.randrange(shafts) for _ in range(ends)]
+        treadling = [rng.randrange(treadles) for _ in range(picks)]
+        tie_up = [
+            [rng.randrange(2) for _ in range(shafts)] for _ in range(treadles)
+        ]
+        cases.append((threading, tie_up, treadling, rng.randint(1, 3),
+                      rng.random() < 0.5, rng.randint(1, 3),
+                      rng.choice([1, 3, 50])))
+    for i, (threading, tie_up, treadling, mf, cyclic, mc, lim) in enumerate(cases):
+        got = search_repair_plans(threading, tie_up, treadling, mf, cyclic,
+                                  max_changes=mc, limit=lim)
+        want = _reference_repair_plans(threading, tie_up, treadling, mf, cyclic,
+                                       mc, lim)
+        check([_plan_signature(p) for p in got]
+              == [_plan_signature(p) for p in want],
+              f"case {i}: plans identical to full recompute "
+              f"(cyclic={cyclic}, max_changes={mc}, limit={lim})")
+
+
+def test_repair_plans_three_flip_performance():
+    """三次翻转搜索耗时回归：8x8 绑综、16x16 交织、max_changes=3、limit=5
+    需逐层枚举约 25 万个绑综状态，逐状态完整重算审计实测超过 20 秒；增量
+    实现必须在 8 秒内返回。同时把每个入选方案按翻转序列重建绑综并完整
+    重算审计，逐项校验与搜索结果一致。"""
+    import time
+
+    threading = [s % 8 for s in range(16)]
+    treadling = [t % 8 for t in range(16)]
+    tie_up = [
+        [1, 1, 1, 0, 0, 0, 1, 1],
+        [1, 1, 1, 1, 0, 0, 0, 1],
+        [1, 1, 1, 1, 1, 0, 0, 0],
+        [0, 1, 1, 1, 1, 1, 0, 0],
+        [0, 0, 1, 1, 1, 1, 1, 0],
+        [0, 0, 0, 1, 1, 1, 1, 1],
+        [1, 0, 0, 0, 1, 1, 1, 1],
+        [1, 1, 0, 0, 0, 1, 1, 1],
+    ]
+    base_matrix, base_violations = audit_floats(
+        threading, tie_up, treadling, 2, True
+    )
+    start = time.perf_counter()
+    plans = search_repair_plans(threading, tie_up, treadling, 2, True,
+                                max_changes=3, limit=5)
+    elapsed = time.perf_counter() - start
+    check(elapsed < 8.0,
+          f"8x8 tie-up, 16x16 interlacing, max_changes=3: "
+          f"{elapsed:.2f}s < 8s")
+    check(0 < len(plans) <= 5, "limit=5 caps the returned plans")
+    for p in plans:
+        check(p.final_violations < len(base_violations),
+              "plan strictly improves over baseline")
+        check(p.changes == len(p.steps), "changes matches step count")
+        # 按翻转序列逐步重建绑综并完整重算：每一步与终态都必须逐项一致
+        final_tie_up = [row[:] for row in tie_up]
+        for k, s in enumerate(p.steps):
+            check(s.step == k + 1, "steps numbered from 1")
+            check(final_tie_up[s.treadle][s.shaft] == s.old_value
+                  and s.new_value == 1 - s.old_value,
+                  "step flips the current cell value")
+            final_tie_up[s.treadle][s.shaft] = s.new_value
+            _, step_violations = audit_floats(
+                threading, final_tie_up, treadling, 2, True
+            )
+            check(len(step_violations) == s.violations_after,
+                  "violations_after matches full recompute at every step")
+        matrix, violations = audit_floats(
+            threading, final_tie_up, treadling, 2, True
+        )
+        check(len(violations) == p.final_violations,
+              "final_violations matches full recompute")
+        check([(v.direction, v.yarn_index, v.start, v.length)
+               for v in violations]
+              == [(v.direction, v.yarn_index, v.start, v.length)
+                  for v in p.violations],
+              "final violation list matches full recompute item by item")
+        check(matrix == p.interlacing,
+              "final interlacing matches full recompute pointwise")
+        check(sum(a != b for row_a, row_b in zip(base_matrix, matrix)
+                  for a, b in zip(row_a, row_b)) == p.changed_points,
+              "changed_points matches full recompute")
+    check(tie_up[0] == [1, 1, 1, 0, 0, 0, 1, 1],
+          "original tie_up unchanged")
 
 
 def test_best_alignment_shift_recovery():
@@ -1315,6 +1550,9 @@ if __name__ == "__main__":
     test_repair_plans_two_flips_needed()
     test_repair_plans_state_dedup()
     test_repair_plans_limit_and_validation()
+    test_repair_plans_line_counter_matches_runs()
+    test_repair_plans_matches_full_recompute()
+    test_repair_plans_three_flip_performance()
     test_best_alignment_shift_recovery()
     test_best_alignment_mismatch_details()
     test_best_alignment_tie_break()
