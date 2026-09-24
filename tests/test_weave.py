@@ -419,6 +419,79 @@ def test_repair_plans_limit_and_validation():
     print("  ok: repair plan parameter validation")
 
 
+def test_repair_plans_match_full_recompute():
+    # 增量计数必须与「每个状态都完整重算矩阵 + violations_of_matrix」逐项一致：
+    # 对入选方案回放 steps 重建绑综，逐步重算审计，核对 violations_after、
+    # 最终违规列表与最终矩阵、changed_points。
+    import random
+    rng = random.Random(20260924)
+    for _ in range(40):
+        shafts = rng.choice([2, 4, 8])
+        treadles = rng.choice([2, 4, 8])
+        ends = rng.choice([8, 16])
+        picks = rng.choice([8, 16])
+        threading = [rng.randrange(shafts) for _ in range(ends)]
+        treadling = [rng.randrange(treadles) for _ in range(picks)]
+        tie_up = [[rng.randrange(2) for _ in range(shafts)]
+                  for _ in range(treadles)]
+        max_float = rng.choice([1, 2, 3])
+        cyclic = rng.random() < 0.5
+        base_matrix, base_violations = audit_floats(
+            threading, tie_up, treadling, max_float, cyclic
+        )
+        tie_up_snapshot = [r[:] for r in tie_up]
+        plans = search_repair_plans(threading, tie_up, treadling,
+                                    max_float, cyclic, max_changes=3, limit=5)
+        check(tie_up == tie_up_snapshot, "tie_up unchanged during search")
+        for p in plans:
+            check(p.final_violations < len(base_violations),
+                  "terminal state strictly improves")
+            flipped = [r[:] for r in tie_up]
+            for i, st in enumerate(p.steps, start=1):
+                check(st.step == i, "step numbered from 1")
+                check(st.new_value == 1 - st.old_value,
+                      "new_value flips old_value")
+                flipped[st.treadle][st.shaft] = st.new_value
+                _, step_v = audit_floats(
+                    threading, flipped, treadling, max_float, cyclic
+                )
+                check(st.violations_after == len(step_v),
+                      "per-step violations_after matches full recompute")
+            final_matrix, final_violations = audit_floats(
+                threading, flipped, treadling, max_float, cyclic
+            )
+            check(p.interlacing == final_matrix,
+                  "reported interlacing matches rebuilt tie_up")
+            check(p.violations == final_violations,
+                  "reported violations match full recompute")
+            changed = sum(
+                a != b
+                for row_a, row_b in zip(base_matrix, final_matrix)
+                for a, b in zip(row_a, row_b)
+            )
+            check(p.changed_points == changed,
+                  "changed_points matches matrix diff")
+    print("  ok: incremental repair search matches full recompute")
+
+
+def test_repair_plans_8x8_16x16_performance():
+    # 回归：8×8 绑综、16×16 交织、max_changes=3、limit=5 必须快速返回
+    # （此前逐层复制整幅矩阵并完整重审，超过 8 秒仍不返回）。
+    import random
+    import time
+    rng = random.Random(777)
+    threading = [rng.randrange(8) for _ in range(16)]
+    treadling = [rng.randrange(8) for _ in range(16)]
+    tie_up = [[rng.randrange(2) for _ in range(8)] for _ in range(8)]
+    start = time.perf_counter()
+    plans = search_repair_plans(threading, tie_up, treadling, 2, False,
+                                max_changes=3, limit=5)
+    elapsed = time.perf_counter() - start
+    check(elapsed < 8.0, f"8x8/16x16 3-flip search under 8s (got {elapsed:.2f}s)")
+    check(len(plans) <= 5, "limit honored")
+    print(f"  ok: 8x8 tie-up / 16x16 matrix 3-flip search in {elapsed:.2f}s")
+
+
 def test_best_alignment_shift_recovery():
     # b 为 a 沿纬向循环移 2 行、经向循环移 1 列：b[h][w] = a[(h+2)%3][(w+1)%3]
     # 对齐约定 aligned[h][w] = b[(h+ro)%H][(w+co)%W]，故最佳偏移为 (1, 2)
@@ -1315,6 +1388,8 @@ if __name__ == "__main__":
     test_repair_plans_two_flips_needed()
     test_repair_plans_state_dedup()
     test_repair_plans_limit_and_validation()
+    test_repair_plans_match_full_recompute()
+    test_repair_plans_8x8_16x16_performance()
     test_best_alignment_shift_recovery()
     test_best_alignment_mismatch_details()
     test_best_alignment_tie_break()
